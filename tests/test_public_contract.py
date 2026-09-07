@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
@@ -365,33 +366,70 @@ def additional_tests() -> None:
         assert engine.ingest(e2) is True
 
     def note_5_snapshot_is_atomic_under_concurrent_ingest_without_relying_on_kafka():
-        # Bounded ingest workload, not an unbounded loop: snapshot() cost
-        # scales with total records held, so racing it against an
-        # open-ended ingest loop makes each side feed the other's growth.
-        engine = RiskEngine(artifact_dir, max_shipments=50)
+        # Broker exactly-once semantics say nothing about whether a local
+        # reader sees a half-written file, nor whether the payload was built
+        # from one consistent view of state. Both are application concerns.
+        #
+        # Two tuning choices carry this test, and getting either wrong makes it
+        # pass against a broken implementation:
+        #
+        #   * 200 resident shipments, not a handful. With a small state the
+        #     payload build finishes inside a single GIL slice, so the ingest
+        #     threads never interleave and no lock is needed to pass.
+        #   * A short switch interval, so the build is actually preempted.
+        #
+        # The snapshot loop drives a fixed 100 iterations rather than looping
+        # until the writers finish: a tight pure-Python ingest loop starves the
+        # snapshotting thread, and this test previously managed one single
+        # verified read.
+        #
+        # Mutation-checked: deleting `with self._lock` from snapshot() fails
+        # this 100/100 with "OrderedDict mutated during iteration".
+        engine = RiskEngine(artifact_dir, max_shipments=200)
+        for i in range(400):
+            engine.ingest(_event(f"warm-{i}", 1, f"w-{i % 200}", received_at=BASE, value=4.0))
+
         snap_path = Path(tempfile.mkdtemp()) / "snap.json"
+        stop = threading.Event()
         errors: list[Exception] = []
 
-        def ingest_loop():
-            for i in range(3000):
+        def churn(worker_id: int):
+            i = 0
+            while not stop.is_set() and i < 200_000:  # bounded, never open-ended
                 engine.ingest(
-                    _event(f"e-{i}", 1, f"s-{i % 20}", received_at=BASE + timedelta(seconds=i), value=float(i % 5))
+                    _event(
+                        f"c{worker_id}-{i}",
+                        1,
+                        f"s-{worker_id}-{i % 500}",  # distinct shipments -> eviction churn
+                        received_at=BASE + timedelta(seconds=i),
+                        value=float(i % 5),
+                    )
                 )
+                i += 1
 
-        ingest_thread = threading.Thread(target=ingest_loop)
-        ingest_thread.start()
+        previous_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        threads = [threading.Thread(target=churn, args=(t,)) for t in range(3)]
+        for thread in threads:
+            thread.start()
         try:
-            while ingest_thread.is_alive():
+            for _ in range(100):
                 engine.snapshot(snap_path)
-                json.loads(snap_path.read_bytes())  # must always be complete, parseable JSON
+                payload = json.loads(snap_path.read_bytes())  # always complete JSON
+                # A payload assembled without the lock can name a shipment in
+                # shipment_order that is absent from shipments, or overrun the
+                # cap, even when the bytes themselves parse cleanly.
+                assert set(payload["shipment_order"]) == set(payload["shipments"])
+                assert len(payload["shipment_order"]) <= payload["max_shipments"]
         except Exception as exc:  # pragma: no cover - failure path
             errors.append(exc)
         finally:
-            ingest_thread.join()
+            stop.set()
+            for thread in threads:
+                thread.join()
+            sys.setswitchinterval(previous_interval)
 
-        engine.snapshot(snap_path)
-        json.loads(snap_path.read_bytes())
-        assert not errors
+        assert not errors, errors[:1]
 
     def note_6_failed_reload_does_not_fall_back_to_a_hardcoded_probability():
         engine = RiskEngine(artifact_dir, max_shipments=10)

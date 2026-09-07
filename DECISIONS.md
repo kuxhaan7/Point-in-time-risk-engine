@@ -1,8 +1,9 @@
 # Decision Record
 
 Everything here is implemented in `src/dispatch_risk/solution.py` and asserted in
-`tests/test_public_contract.py`. One rule runs through all of it: a score may only
-use what the platform actually knew at the instant it was asked.
+`tests/test_public_contract.py`. One rule runs through all of it: a score may only use what the platform actually knew at the instant it was asked.
+
+**Module shape.** `solution.py` exposes exactly three names — `build_training_rows`, `train`, `RiskEngine`. The point-in-time kernel (`_visible_events` → `_features` → `_predict_proba`) lives as private static methods on `RiskEngine`, and the offline builder replays through it rather than reimplementing it; training-only numerics are nested inside `train()`. Sharing one kernel is what makes train/serve feature skew unexpressible rather than merely unlikely.
 
 ## Event-time and knowledge-time policy
 
@@ -24,9 +25,10 @@ use what the platform actually knew at the instant it was asked.
 - **Feature names are derived from the `kind`s present, not a fixed schema.** An unseen event kind produces new columns instead of a crash; `train()` unions every row's keys into one persisted schema and imputes what a given row lacks.
 - **Per kind: count, age and value of the latest reading, mean, max, slope per hour.** There is no `_min` — the target is an excursion *above* a threshold, so the coldest reading in the window carries no signal for it.
 - **Ridge logistic regression, fit by Newton's method (IRLS).** No learning rate to tune, converges in a handful of iterations at this width, and is fully deterministic — no RNG, no minibatching, so identical rows always produce an identical `model_version`.
-- **Every numeric is hand-rolled on the standard library.** The evaluator has no network access, so neither numpy nor scikit-learn can be assumed installable; `pyproject.toml` declares zero runtime dependencies.
+- **Every numeric is hand-rolled on the standard library.** The evaluator has no network access, so neither numpy nor scikit-learn can be assumed installable; `pyproject.toml` declares zero runtime dependencies and a clean-venv install loads no third-party module. The one exception is `statistics.median`, which is stdlib and bit-identical to the hand-rolled version it replaced.
+- **The logistic function saturates instead of overflowing.** A score below −709 returns `0.0` rather than raising `OverflowError` from `math.exp`; in range the arithmetic is unchanged, so this costs nothing and removes a crash a degenerate model could cause.
 - **The artifact is self-contained.** `model.json` carries columns, medians, means, standard deviations, weights, bias and version — enough to reproduce any score in a fresh process with no access to the training data.
-- **The holdout is scored through `predict_proba()`, the same function that serves.** That makes the evaluation a proof that the persisted artifact reproduces training-time scores, rather than a separate code path that might not.
+- **The holdout is scored through `RiskEngine._predict_proba()`, the same function that serves.** That makes the evaluation a proof that the persisted artifact reproduces training-time scores, rather than a separate code path that might not.
 - **Reported: average precision, Brier score, a constant-prevalence baseline, and two slices.** Prevalence is printed alongside because it is what makes the rest readable — average precision at 8% positives means something very different than at 50%.
 
 ## State, idempotency, and eviction
@@ -43,6 +45,7 @@ use what the platform actually knew at the instant it was asked.
 - **A reload validates before it activates.** Required keys, `feature_columns`/`weights` agreement, and finiteness of every coefficient are checked on the candidate; if any fails, the previous model keeps serving and `reload_model()` returns `False`.
 - **A NaN weight is rejected at load, not at serialization.** It would otherwise load cleanly and only blow up later inside `Prediction.to_wire()`, which is far from the deploy that caused it.
 - **`snapshot()` is write-temp → fsync → rename.** A concurrent reader sees either the whole old file or the whole new one, never a partial write.
+- **The payload is also *built* under the lock, which is the harder half.** Bytes that parse cleanly can still describe an inconsistent state if the map mutates mid-assembly; `note_5_...` verifies this by asserting `shipment_order` and `shipments` always agree, and is mutation-checked — deleting the lock makes it fail 100/100 with `OrderedDict mutated during iteration`.
 - **Reload leaves ingested state untouched.** Only the model reference is swapped.
 
 ## Rejected or reinterpreted customer notes
@@ -67,6 +70,7 @@ use what the platform actually knew at the instant it was asked.
 - **One global model, no per-source specialization.** Source appears as an evaluation slice, not as a feature or a routing key.
 - **Snapshot is a full rewrite, not incremental.** Cost is proportional to total records held — fine at `max_shipments=32`, not a design for very large state.
 - **No time-decay or windowing on features.** Every visible event counts equally regardless of age, so a long-running shipment's early readings never age out.
+- **Slices with no positives report `average_precision: nan`.** Average precision is undefined without a positive, and `nan` is the honest answer rather than a fabricated `0.0` — but on small streams several slices will show it, so the field needs reading alongside `n` and `positive_rate`.
 - **`restore()` trusts the snapshot it reads,** on the assumption that it is our own file, not attacker-controlled input.
 - **Not attempted in the timebox:** cross-validated hyperparameter selection (`L2_PENALTY` is fixed at 1.0), feature selection, and any monitoring of live feature drift.
 
