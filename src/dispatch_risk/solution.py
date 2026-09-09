@@ -56,8 +56,7 @@ def build_training_rows(
     for shipment_id, decision_time in decision_times:
         decision_time = RiskEngine._to_utc(decision_time)
 
-        # The same two steps RiskEngine.score() runs, minus the model. Replaying
-        # through the engine's own kernel is what rules out train/serve skew.
+        # Replaying through the engine's own kernel is what rules out train().
         visible = RiskEngine._visible_events(
             events_by_shipment.get(shipment_id, ()), decision_time
         )
@@ -72,8 +71,7 @@ def build_training_rows(
             )
         )
 
-        # `source` is the slicing dimension train() reports on; features
-        # already describe everything else about the row.
+        # `source` is the slicing dimension train() reports on
         visible_sources = sorted({e.source for e in visible})
 
         rows.append(
@@ -90,12 +88,7 @@ def build_training_rows(
 
 
 def train(rows: Sequence[TrainingRow], artifact_dir: Path) -> Mapping[str, object]:
-    """Fit, evaluate and persist a self-contained artifact; return the report.
-
-    Writes `model.json` (everything needed to reproduce a score in a fresh
-    process) and `metrics.json`. The holdout is scored through
-    `RiskEngine._predict_proba()`, the same function the engine serves with.
-    """
+    """Fit, evaluate and persist a self-contained artifact; return the report."""
     if not rows:
         raise ValueError("train() requires at least one row")
 
@@ -134,10 +127,7 @@ def train(rows: Sequence[TrainingRow], artifact_dir: Path) -> Mapping[str, objec
         return [row[n] for row in aug]
 
     def fit_logistic(X: Sequence[Sequence[float]], y: Sequence[float]) -> tuple[float, list[float]]:
-        """Ridge logistic regression by Newton's method (IRLS).
-
-        No learning rate to tune, and deterministic — identical rows, identical weights.
-        """
+        """Ridge logistic regression by Newton's method (IRLS), identical rows, identical weights."""
         n = len(X)
         d = len(X[0]) if n else 0
         design = [[1.0] + list(row) for row in X]  # bias column first
@@ -191,11 +181,7 @@ def train(rows: Sequence[TrainingRow], artifact_dir: Path) -> Mapping[str, objec
         return sum((p - y) ** 2 for p, y in zip(probabilities, y_true)) / len(y_true)
 
     def vectorize(features: Mapping[str, object], schema: Mapping[str, Any]) -> list[float]:
-        """Feature mapping -> model-order vector: impute missing, then standardize.
-
-        Mirrors RiskEngine._predict_proba's own imputation and scaling, which is
-        why the holdout is scored through the engine rather than through these.
-        """
+        """Feature mapping -> model-order vector: impute missing, then standardize."""
         medians, means = schema["impute_median"], schema["feature_mean"]
         stds = schema["feature_std"]
         vector = []
