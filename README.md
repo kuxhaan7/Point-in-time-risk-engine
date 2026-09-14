@@ -1,170 +1,80 @@
-# Take-Home: Point-in-Time Risk Engine
+# Point-in-Time Risk Engine
 
-**Role:** Senior Machine Learning Software Engineer  
-**Expected effort:** 7 hours maximum  
-**Language:** Python 3.11+  
+Online risk engine for refrigerated shipments: estimates the probability of a **temperature excursion in the next six hours**, re-scoring after every accepted event. Events arrive at least once, late, out of order, corrected by a higher revision, and sometimes with a bad device clock.
 
-Do not spend time on UI, infrastructure-as-code, or presentation slides. We assess the repository, executable behavior, tests, and technical decisions.
+One rule runs through it: **a score may only use what had arrived by the decision time.** `received_at` gates visibility; `device_time` is a claim, not a permission.
 
-## Scenario
+Zero runtime dependencies (stdlib only, numerics included). Deterministic — two replays produce byte-identical predictions and snapshots. Thread-safe under concurrent ingest, score, snapshot and reload.
 
-You own an online risk engine for refrigerated shipments. A device stream reports temperature, door, compressor, and location events. The engine must estimate whether a shipment will suffer a temperature excursion in the next six hours.
-
-Events are delivered at least once. They can arrive late, be corrected, or carry a bad device clock. Operations wants a prediction after every accepted event. Labels arrive later from audited incident records.
-
-You are given a deterministic data generator and a small starter interface. Build a thin training-and-serving implementation that is correct under replay and usable under concurrent scoring and model reload.
-
-## Input records
-
-Telemetry is JSON Lines. Every event contains:
-
-```json
-{
-  "event_id": "evt-123",
-  "revision": 2,
-  "shipment_id": "s-17",
-  "device_time": "2026-01-12T10:03:00-05:00",
-  "received_at": "2026-01-12T15:07:13Z",
-  "kind": "temperature_c",
-  "value": 9.4,
-  "source": "sensor-v2",
-  "payload": {"firmware": "4.8.1"}
-}
-```
-
-Labels are also JSON Lines:
-
-```json
-{
-  "incident_id": "inc-88",
-  "shipment_id": "s-17",
-  "incident_at": "2026-01-12T20:15:00Z",
-  "label_available_at": "2026-01-14T09:00:00Z",
-  "severity": 2
-}
-```
-
-Important semantics:
-
-- `(event_id, revision)` identifies a delivered record.
-- A higher revision supersedes lower revisions with the same `event_id`.
-- `device_time` is when the device claims the measurement occurred.
-- `received_at` is when the platform could first use that revision.
-- Input order is delivery order and is not guaranteed to be chronological.
-- All public outputs must use UTC-aware timestamps.
-- An incident is positive for an `as_of` time if it occurs in `(as_of, as_of + 6 hours]`.
-
-## Required implementation
-
-Implement the functions and class in `src/dispatch_risk/solution.py`. You may change other starter files while keeping the public contract stable.
-
-### 1. Point-in-time training set
-
-Implement:
-
-```python
-build_training_rows(events, labels, decision_times)
-```
-
-For each `(shipment_id, decision_time)`, produce features, a binary label, and metadata. A feature may use only information that would have been available to the platform at that decision time.
-
-You must make and document a policy for corrected events whose latest revision arrives after a decision time.
-
-### 2. Model training and artifact
-
-Implement:
-
-```python
-train(rows, artifact_dir)
-```
-
-The artifact must be loadable in a fresh Python process and include everything required to reproduce feature interpretation and scoring.
-
-Report at least:
-
-- the evaluation split rule;
-- PR-AUC or average precision;
-- one probability-quality metric;
-- performance against a constant or simple rule baseline;
-- results for at least two operationally meaningful slices.
-
-Do not optimize for a leaderboard. We care more about whether the evaluation estimates future behavior.
-
-### 3. Online engine
-
-Implement `RiskEngine` with the contract in `contracts.py`.
-
-It must:
-
-- accept duplicate, late, out-of-order, and corrected events;
-- make repeated delivery of the same record idempotent;
-- score a shipment as of an explicit UTC timestamp;
-- return the model version and a deterministic feature digest;
-- snapshot and restore its state;
-- enforce `max_shipments` without unbounded auxiliary structures;
-- reload a valid model while scoring requests are active;
-- keep serving the previous model if a reload fails.
-
-Two identical replays from an empty state must produce byte-identical serialized predictions and snapshots.
-
-### 4. Tests
-
-Add tests for the failure modes you think are most dangerous. We will run public and private tests, including generated streams not present in this repository.
-
-### 5. Decision record
-
-Complete `DECISIONS.md`. Keep it concise and concrete. Explicitly state anything you chose not to implement within the timebox.
-
-## Customer-provided implementation notes
-
-The following notes came from different customer engineers. Treat them as requirements unless you believe one is unsafe or technically invalid. If you reject or reinterpret one, do so explicitly in `DECISIONS.md` and implement the safer contract.
-
-1. “Use a random 80/20 row split; we need every carrier represented in both sets.”
-2. “Always apply the newest revision of an event, even when replaying an old decision.”
-3. “Sort everything by device time before replay so the model sees the real sequence.”
-4. “Deduplicate on `shipment_id`; downstream only needs one current prediction.”
-5. “Kafka is exactly-once, so snapshot consistency does not need application logic.”
-6. “If the model cannot load, return probability `0.0` to preserve the API SLO.”
-7. “Use the full incident table during feature generation; it is the authoritative source.”
-8. “AUC above 0.90 is sufficient for launch.”
-9. “Keep every shipment in memory because historical corrections can arrive at any time.”
-10. “Model reload may briefly clear in-memory state; deploys occur during low traffic.”
-
-No clarification is available during the exercise. Make reasonable assumptions and record them.
-
-## Constraints
-
-- The private evaluator has no network access.
-- Tests may call the engine from several threads.
-- The evaluator may set `max_shipments=32` and replay more than 10,000 events.
-- Do not key logic to sample IDs, fixed row counts, or dates in the generated data.
-- Avoid hosted APIs and external model services.
-- Dependencies must be declared in `pyproject.toml`.
-
-## Run instructions
-
-Generate the sample data:
+## Run
 
 ```bash
-python tools/generate_dataset.py
+python3 tools/generate_dataset.py      # deterministic; writes data/
+python3 -m pip install -e '.[dev]' && python3 -m pytest
+python3 tools/demo.py                  # full pipeline, end to end
 ```
 
-Install and run:
+## API
 
-```bash
-python -m pip install -e '.[dev]'
-pytest
+```python
+build_training_rows(events, labels, decision_times) -> list[TrainingRow]
+train(rows, artifact_dir)                           -> report; writes model.json + metrics.json
+RiskEngine(artifact_dir, max_shipments=10_000)      # ingest / score / reload_model / snapshot / restore / stats
 ```
 
-Your submission should include generated data only if its total compressed size is below 5 MB.
+## Implementation
 
-## Follow-up
+[solution.py](src/dispatch_risk/solution.py)
 
-In a 60-minute technical interview, you will:
+- **One kernel, offline and online.** [`_visible_events`](src/dispatch_risk/solution.py#L360) → [`_features`](src/dispatch_risk/solution.py#L378) → [`_predict_proba`](src/dispatch_risk/solution.py#L444) are statics on `RiskEngine`; the offline builder replays through them and `train()` scores its holdout through them. Train/serve skew has no second implementation to drift from.
+- **Visibility.** Highest revision per `event_id` with `received_at <= as_of`. Corrections are never applied retroactively. Full revision history is kept, since `score()` must answer for an `as_of` earlier than something already ingested.
+- **Features** derive from the `kind`s present, not a fixed schema (9 columns on the sample data): counts, recency, clock skew, and per kind `_last_value` / `_mean` / `_max` / `_slope_per_hr`. No `_min` — the target is an excursion *above* a threshold.
+- **Idempotency** keys on `(event_id, revision)`; a seen key is a no-op, any new key is new information.
+- **Bounded state** via an `OrderedDict` LRU — the store is the eviction index, so nothing auxiliary can grow.
+- **Concurrency**: one `RLock` guards the shipment map and the model reference, held while touching state, released before the arithmetic — a reload can't swap the model mid-prediction.
+- **Reload validates before activating** (keys, column/weight agreement, finite coefficients). On failure the old model keeps serving and `reload_model()` returns `False`.
+- **Snapshot** builds its payload under the lock, then writes temp → `fsync` → `rename`. Bytes that parse cleanly can still describe an inconsistent state.
 
-- run your solution against a new event stream;
-- investigate one failed invariant;
-- modify one requirement;
-- defend the statistical validity of your evaluation;
-- make a small code change while preserving replay determinism.
+## Model
 
+**Ridge logistic regression by Newton's method (IRLS)**, hand-rolled on the stdlib ([`fit_logistic`](src/dispatch_risk/solution.py#L129)). No learning rate, no RNG, no minibatching — identical rows give identical weights and an identical `model_version` (a sha256 content hash). Bias unpenalized so the model can match the base rate. Median imputation and z-scoring fit on **training rows only**. `model.json` carries columns, medians, means, stds, weights, bias and version: enough to reproduce any score in a fresh process.
+
+A linear model is the deliberate choice — the interesting risk here is leakage and replay correctness, not model capacity.
+
+**Evaluation.** Split grouped by shipment and ordered in time: the last 40% of shipments held out whole, so no eval row shares its shipment's telemetry with training. Labels come from incidents alone, features from events alone; positive iff an incident falls in the half-open `(as_of, as_of + 6h]`.
+
+| Holdout 720 rows / 240 shipments | prevalence 0.076 |
+|---|---|
+| Average precision | **0.977** (constant baseline 0.079) |
+| Brier | 0.00497 |
+| By source | central 1.000 · coast 0.985 · north 0.949 |
+| By richness | sparse 1.000 · rich 0.979 |
+
+Read the headline skeptically: the generator's excursion rule is nearly deterministic given the features. It shows the pipeline is wired correctly, not production skill.
+
+## Customer notes
+
+Ten notes came from customer engineers, to be treated as requirements unless unsafe. Nine rejected, one reinterpreted — each pinned by a test named for its number.
+
+| # | Note | Verdict |
+|---|---|---|
+| 1 | Random 80/20 row split | **Rejected** — puts one shipment on both sides; measures memorization. |
+| 2 | Always apply the newest revision | **Rejected** — rewrites decisions made before the correction arrived. |
+| 3 | Sort by `device_time` before replay | **Rejected** — a stale clock would grant early visibility. |
+| 4 | Deduplicate on `shipment_id` | **Rejected** — identity is `(event_id, revision)`. |
+| 5 | Kafka is exactly-once, snapshots need no app logic | **Rejected** — says nothing about a half-written local file. |
+| 6 | Return `0.0` if the model can't load | **Rejected** — a confidently wrong answer with a healthy status code. |
+| 7 | Use the full incident table in features | **Rejected** — not knowable at decision time; leakage. |
+| 8 | AUC > 0.90 is sufficient | **Reinterpreted** — says nothing about calibration or who the model fails; hence AP, Brier, baseline, slices. |
+| 9 | Keep every shipment in memory | **Rejected** — unbounded, and the spec caps it. |
+| 10 | Reload may briefly clear state | **Rejected** — loses history late corrections still need. |
+
+Full reasoning in [DECISIONS.md](DECISIONS.md).
+
+## Tests
+
+[tests/test_public_contract.py](tests/test_public_contract.py) — 27 invariants plus the wire-format check, covering leakage (corrections after a decision, early-delivered future events, labels never reaching features), replay determinism, the half-open window, bounded state at evaluator scale (`max_shipments=32`, >10,000 events), reload rejection paths, concurrency, and one test per rejected customer note.
+
+## Limitations
+
+Calibration is measured, not corrected. No time decay on features. Snapshot is a full rewrite. `restore()` trusts its snapshot. Eviction is amnesia — the accepted cost of bounding by shipment count. Not attempted: hyperparameter search, feature selection, per-source models, drift monitoring.

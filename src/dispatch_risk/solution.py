@@ -12,10 +12,10 @@ from typing import Any, Iterable, Mapping, Sequence
 from .contracts import Prediction, TelemetryEvent, TrainingRow
 
 HORIZON = timedelta(hours=6)
-EVAL_FRACTION = 0.2
-L2_PENALTY = 1.0
-NEWTON_ITERATIONS = 50
-NEWTON_TOL = 1e-8
+EVAL_FRACTION = 0.4
+L2_PENALTY = 3.0
+NEWTON_ITERATIONS = 100
+NEWTON_TOL = 1e-4
 
 MODEL_FILENAME = "model.json"
 METRICS_FILENAME = "metrics.json"
